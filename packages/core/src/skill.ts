@@ -47,6 +47,11 @@ export class LoadError extends Schema.TaggedError<LoadError>()("Skill.LoadError"
 /** A skill's SKILL.md body or one of its files: inline, or loaded the first time it's needed. */
 export type Content = string | Effect.Effect<string, LoadError>
 export type File = string | Uint8Array | Effect.Effect<string | Uint8Array, LoadError>
+/**
+ * Looks up a skill no registered skill has the ID of, such as one a source can find by address, registers it, and
+ * returns the ID it registered it under. `undefined` when the ID isn't one this source knows how to look up.
+ */
+export type Resolver = (id: string) => Effect.Effect<ID | undefined, LoadError>
 
 export const available = (skills: ReadonlyArray<Info>, policy: PermissionPolicy.Policy) =>
   skills.filter((skill) => PermissionPolicy.evaluate(policy, "skill", skill.id).effect !== "deny")
@@ -115,6 +120,7 @@ export type Data = {
   skills: Map<ID, Types.DeepMutable<Info>>
   files: Map<ID, ReadonlyMap<string, File>>
   loaders: Map<ID, Effect.Effect<string, LoadError>>
+  resolvers: Resolver[]
 }
 
 export type Editor = {
@@ -124,6 +130,7 @@ export type Editor = {
   add: (skill: Omit<Info, "content"> & { readonly content: Content }, files?: Readonly<Record<string, File>>) => void
   update: (id: string, update: (skill: Types.DeepMutable<Info>) => void) => void
   remove: (id: string) => void
+  resolve: (resolver: Resolver) => void
 }
 
 export interface Interface extends State.Transformable<Editor> {
@@ -138,6 +145,8 @@ export interface Interface extends State.Transformable<Editor> {
    */
   readonly read: (id: ID, file: string) => Effect.Effect<Uint8Array, NotFoundError | FileNotFoundError | LoadError>
   readonly list: () => Effect.Effect<Info[]>
+  /** The skill with this ID, or the one a registered resolver finds for it. */
+  readonly resolve: (id: string) => Effect.Effect<Info | undefined, LoadError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Skill") {}
@@ -149,7 +158,7 @@ const layer = Layer.effect(
 
     const state = State.create<Data, Editor>({
       name: "skill",
-      initial: () => ({ skills: new Map(), files: new Map(), loaders: new Map() }),
+      initial: () => ({ skills: new Map(), files: new Map(), loaders: new Map(), resolvers: [] }),
       editor: (editor) => ({
         list: () => Array.from(editor.skills.values()),
         get: (id) => editor.skills.get(ID.make(id)),
@@ -181,6 +190,9 @@ const layer = Layer.effect(
           editor.skills.delete(key)
           editor.files.delete(key)
           editor.loaders.delete(key)
+        },
+        resolve: (resolver) => {
+          editor.resolvers.push(resolver)
         },
       }),
       notify: State.changes(
@@ -225,6 +237,15 @@ const layer = Layer.effect(
       }),
       list: Effect.fn("Skill.list")(function* () {
         return Array.from(state.get().skills.values())
+      }),
+      resolve: Effect.fn("Skill.resolve")(function* (id) {
+        const known = state.get().skills.get(ID.make(id))
+        if (known) return known
+        for (const resolver of state.get().resolvers) {
+          const resolved = yield* resolver(id)
+          if (resolved) return state.get().skills.get(resolved)
+        }
+        return undefined
       }),
     })
   }),

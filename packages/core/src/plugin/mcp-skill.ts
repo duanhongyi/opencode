@@ -3,6 +3,7 @@ export * as McpSkillPlugin from "./mcp-skill.js"
 import { define } from "@opencode/plugin/effect/plugin"
 import { Hash } from "@opencode/util/hash"
 import { Effect, Stream } from "effect"
+import { McpEvent } from "@opencode/schema/mcp-event"
 import { Bus } from "../bus.js"
 import type { McpClient } from "../mcp/client.js"
 import { Mcp } from "../mcp/index.js"
@@ -10,10 +11,14 @@ import { AbsolutePath } from "../schema.js"
 import { Skill } from "../skill.js"
 import { SkillDiscovery } from "../skill/discovery.js"
 
+/** A skill a server listed, or one it confirmed by URI through `skills/get` without listing it. */
+type Served = Mcp.Skill & { readonly confirmed?: boolean }
+
 /**
- * Registers the skills connected MCP servers list as `<server>:<name>`. Nothing is read until a skill or one of its
- * files is used, and the MCP client checks every file it reads against the listed size and digest. Verified files are
- * kept in memory by digest, so a skill whose SKILL.md was loaded once lists its content.
+ * Registers the skills connected MCP servers list as `<server>:<name>`, and resolves `<server>:<SKILL.md uri>` to a skill
+ * the server confirms without listing it. Nothing is read until a skill or one of its files is used, and the MCP client
+ * checks every file it reads against the listed size and digest. Verified files are kept in memory by digest, so a
+ * skill whose SKILL.md was loaded once lists its content.
  */
 export const Plugin = define({
   id: "opencode.mcp.skill",
@@ -21,7 +26,48 @@ export const Plugin = define({
     const mcp = yield* Mcp.Service
     const bus = yield* Bus.Service
     const skills = yield* Skill.Service
-    const state = { listed: yield* mcp.skills() }
+    const state = {
+      listed: yield* mcp.skills(),
+      // Confirmed skills by server, until the server's connection changes.
+      confirmed: new Map<Mcp.ServerName, McpClient.Skill[]>(),
+      // The ID each served skill was registered under, by server and URI.
+      registered: new Map<string, Skill.ID>(),
+    }
+    const key = (server: string, uri: string) => `${server} ${uri}`
+    const served = (): Served[] => [
+      ...state.listed,
+      ...Array.from(state.confirmed).flatMap(([server, entries]) =>
+        entries
+          .filter((entry) => !state.listed.some((skill) => skill.server === server && skill.entry.uri === entry.uri))
+          .map((entry) => ({ server, entry, confirmed: true })),
+      ),
+    ]
+
+    const resolve: Skill.Resolver = (id) =>
+      Effect.gen(function* () {
+        const target = address(id)
+        if (!target) return undefined
+        const server = Mcp.ServerName.make(target.server)
+        const entry = yield* mcp
+          .getSkill({ server, uri: target.uri })
+          .pipe(
+            Effect.mapError(
+              (error) =>
+                new Skill.LoadError({
+                  skill: id,
+                  message: `MCP server "${server}" did not confirm ${target.uri}: ${error.message}`,
+                }),
+            ),
+          )
+        if (!state.registered.has(key(server, entry.uri))) {
+          state.confirmed.set(server, [
+            ...(state.confirmed.get(server) ?? []).filter((skill) => skill.uri !== entry.uri),
+            entry,
+          ])
+          yield* skills.reload()
+        }
+        return state.registered.get(key(server, entry.uri))
+      })
     const cache = new Map<string, McpClient.SkillFile>()
 
     const read = (skill: Mcp.Skill, id: Skill.ID, digest: string, file?: string) =>
@@ -51,12 +97,29 @@ export const Plugin = define({
       ),
       Effect.forkScoped({ startImmediately: true }),
     )
+    // A server's confirmed skills belong to the connection that confirmed them.
+    yield* bus.subscribe(McpEvent.StatusChanged).pipe(
+      Stream.runForEach((event) =>
+        Effect.gen(function* () {
+          const server = Mcp.ServerName.make(event.data.server)
+          if (!state.confirmed.has(server)) return
+          const current = (yield* mcp.servers()).find((item) => item.name === server)
+          if (current?.status.status === "connected") return
+          state.confirmed.delete(server)
+          yield* skills.reload()
+        }),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    )
 
     yield* skills.transform((editor) => {
-      for (const { skill, id } of ids(state.listed)) {
+      editor.resolve(resolve)
+      state.registered.clear()
+      for (const { skill, id } of ids(served())) {
         // Dynamic skills list no files, so nothing they serve can be verified.
         if (skill.entry.resources === "dynamic") continue
         if (!SkillDiscovery.isSafeSegment(id) || editor.get(id)) continue
+        state.registered.set(key(skill.server, skill.entry.uri), id)
         const root = skill.entry.uri.slice(0, skill.entry.uri.lastIndexOf("/") + 1)
         const files = skill.entry.resources.flatMap((resource) => {
           const file = resource.uri.startsWith(root) ? resource.uri.slice(root.length) : ""
@@ -96,7 +159,7 @@ export const Plugin = define({
  * one skill under two URI schemes, also get a hash of the URI. Skills confirmed by URI are named after the listed ones
  * and never rename them: a taken name gets the confirmed skill's whole path, then a hash.
  */
-export function ids(skills: ReadonlyArray<Mcp.Skill>) {
+function ids(skills: ReadonlyArray<Served>) {
   const verifiable = skills.filter((skill) => skill.entry.resources !== "dynamic")
   const listed = Array.from(
     Map.groupBy(
@@ -136,7 +199,7 @@ const path = (uri: string) =>
     .split("/")
 
 /** A skill addressed as `<server>:<SKILL.md uri>`, as in `docs:skill://acme/billing/refunds/SKILL.md`. */
-export function address(value: string) {
+function address(value: string) {
   const colon = value.indexOf(":")
   if (colon <= 0) return undefined
   const uri = value.slice(colon + 1)

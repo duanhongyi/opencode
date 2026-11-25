@@ -194,31 +194,34 @@ describe("MCP skills", () => {
     }),
   )
 
-  it.live("registers a skill the server confirms by URI without listing it", () =>
+  it.live("resolves a skill the server confirms by URI without listing it", () =>
     Effect.gen(function* () {
       const disputes = { "SKILL.md": "---\nname: disputes\ndescription: Handle disputes\n---\n# Disputes\n" }
       const server = yield* skillServer({ deploy }, { unlisted: { "billing/disputes": disputes } })
       yield* connect("team", server.url, ["team:deploy"])
-      const mcp = yield* Mcp.Service
-      const confirmed = yield* mcp.getSkill({ server: "team", uri: "skill://billing/disputes/SKILL.md" })
-      expect(confirmed.entry.frontmatter.name).toBe("disputes")
       const skills = yield* Skill.Service
       const disputesID = Skill.ID.make("team:disputes")
-      yield* eventually(skills.list(), (listed) => listed.some((skill) => skill.id === disputesID))
+
+      expect(yield* skills.resolve("team:deploy")).toMatchObject({ id })
+      expect(yield* skills.resolve("team:skill://billing/disputes/SKILL.md")).toMatchObject({ id: disputesID })
+      expect((yield* skills.list()).map((skill) => skill.id)).toContain(disputesID)
       expect(server.state.reads).toEqual([])
       expect(yield* skills.content(disputesID)).toBe("# Disputes\n")
+      expect(yield* skills.resolve("team:skill://billing/missing/SKILL.md").pipe(Effect.flip)).toBeInstanceOf(
+        Skill.LoadError,
+      )
 
       // A confirmed skill whose name is taken is named by its path, and the listed skill keeps its ID.
       const other = { "SKILL.md": "---\nname: deploy\ndescription: Other deploy\n---\n# Other\n" }
       const second = yield* skillServer({ deploy }, { unlisted: { "billing/deploy": other } })
       yield* connect("ops", second.url, ["ops:deploy"])
-      yield* mcp.getSkill({ server: "ops", uri: "skill://billing/deploy/SKILL.md" })
-      const renamed = yield* eventually(skills.list(), (listed) =>
-        listed.some((skill) => skill.id === Skill.ID.make("ops:billing.deploy")),
-      )
-      expect(renamed.some((skill) => skill.id === Skill.ID.make("ops:deploy"))).toBe(true)
+      expect(yield* skills.resolve("ops:skill://billing/deploy/SKILL.md")).toMatchObject({
+        id: Skill.ID.make("ops:billing.deploy"),
+      })
+      expect((yield* skills.list()).map((skill) => skill.id)).toContain(Skill.ID.make("ops:deploy"))
 
       // Pointing the server name at another server drops what the old one confirmed.
+      const mcp = yield* Mcp.Service
       const replacement = yield* skillServer({ deploy })
       yield* mcp.add("team", new ConfigMCP.Remote({ type: "remote", url: replacement.url, oauth: false }))
       yield* eventually(
